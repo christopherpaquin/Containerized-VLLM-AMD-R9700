@@ -54,7 +54,7 @@ VRAM math (see also the profile file's inline comments):
 - FP8/INT8: ~30 GB weights alone, leaving effectively nothing for KV cache
   inside the ~22-24 GB budget this repo targets (see docs/TUNING.md).
 - **AWQ INT4** (chosen): ~17-18 GB weights, leaving headroom for KV cache at
-  the 16K baseline context.
+  the 32K context (see below).
 
 `MODEL_ID` defaults to `stelterlab/Qwen3-Coder-30B-A3B-Instruct-AWQ`, a
 **third-party** quantization (built via the standard `llm-compressor`
@@ -70,23 +70,31 @@ independently verified here. Alternatives if you want to compare:
   revisit once gfx1201 FP8 kernel support is confirmed working, and only
   with a relaxed VRAM budget or reduced context.
 
-**Context:** baseline is 16K (`MAX_MODEL_LEN=16384`), deliberately far below
-the model's advertised maximum. The task plan calls for evaluating 8K/16K/32K
-— do that via `scripts/benchmark.sh` once 16K is confirmed working, changing
-one variable at a time (see docs/TUNING.md).
+**Context:** started at a conservative 16K baseline (`MAX_MODEL_LEN=16384`),
+**raised to 32K live on `scar.lab`** after a real OpenCode "build" agent
+session hit the 16K ceiling — normal multi-turn coding sessions (file
+contents, tool output, conversation history) fill 16K faster than expected,
+and once accumulated input + the reserved output budget crossed 16384
+tokens, every subsequent request in that session failed outright. Not a
+bug — 16K was simply too small for sustained agentic use, and the fix was
+exactly what docs/TUNING.md's baseline → change → measure → keep process
+describes. Still well below the model's advertised maximum context — if 32K
+proves insufficient too, the same process applies again.
 
 **This is the repo's default profile** (`DEFAULT_MODEL_PROFILE` in `.env`) —
 `scripts/start.sh` with no arguments starts this. **Verified live on
 `scar.lab`:** starts cleanly (once `QUANTIZATION` was left unset — see the
 compressed-tensors note above), weights load at 15.74 GiB. `GPU_MEMORY_UTILIZATION`
-was tuned from 0.72 down to **0.68** via a live sweep — see docs/TUNING.md
-for the full comparison table; at 0.68, KV cache gets 4.6 GiB (~50K tokens,
-~3.1x concurrency headroom at 16K context), real total VRAM used is
-**~23.9 GiB**, leaving **~7.7-8 GiB** for the desktop. A quick single-stream
-benchmark (512-token prompt, 128 max tokens) measured **~43 tok/s** —
-notably faster than the 14B dense model's ~10 tok/s in the same test,
-consistent with the ~3.3B active-parameter compute cost per token despite
-the larger total weight footprint. `scripts/workstation-benchmark.sh`
+was tuned from 0.72 down to **0.68** via a live sweep at the (then-)16K
+context — see docs/TUNING.md for the full comparison table. Re-confirmed
+live after raising context to 32K: KV cache gets 4.51 GiB (~49K tokens,
+~1.5x concurrency headroom at 32K), real total VRAM used is still
+**~23.9 GiB**, leaving **~8.0 GiB** for the desktop — the utilization choice
+held up under the larger context. A quick single-stream benchmark (512-token
+prompt, 128 max tokens) measured **~43 tok/s** — notably faster than the 14B
+dense model's ~10 tok/s in the same test, consistent with the ~3.3B
+active-parameter compute cost per token despite the larger total weight
+footprint. `scripts/workstation-benchmark.sh`
 additionally confirmed this holds with a real browser + IDE + concurrent
 inference all running at once (docs/BENCHMARKING.md). Also verified: tool
 calling (required for OpenCode — see docs/OPENCODE.md) via

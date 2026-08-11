@@ -15,9 +15,14 @@ real total VRAM (rocm-smi, whole-system) runs a few GiB over the nominal
 percentage, because graph-capture buffers and allocator overhead sit outside
 vLLM's own weights+KV-cache accounting. So every row below is what was
 actually measured after a real `scripts/start.sh` + `scripts/gpu-info.sh`,
-not `utilization × 32 GiB`:
+not `utilization × 32 GiB`. **This sweep was run at the profile's original
+16K context** (see "Context length was raised to 32K" below) — the
+utilization/VRAM-used/desktop-reserve columns are still the relevant
+evidence for the 0.68 choice and were re-confirmed at 32K afterward; the
+KV-cache-tokens/concurrency columns are 16K-specific and don't carry over
+(32K roughly halves both, as expected):
 
-| `GPU_MEMORY_UTILIZATION` | Real VRAM used | Desktop reserve | KV cache | Concurrency @ 16K | tok/s (c=1) |
+| `GPU_MEMORY_UTILIZATION` | Real VRAM used | Desktop reserve | KV cache @ 16K | Concurrency @ 16K | tok/s (c=1) |
 |---|---|---|---|---|---|
 | 0.72 | 25.12 GiB | 6.74 GiB | 63,152 tok | 3.85x | 42.4 |
 | **0.68 (chosen)** | **23.88 GiB** | **7.98 GiB** | **50,400 tok** | **3.08x** | **42.6** |
@@ -63,6 +68,37 @@ default:
 default) if you want it for a specific, deliberate reason — e.g. pinning an
 exact, predictable KV cache size across model swaps rather than
 recalculating a percentage each time.
+
+## Case study: context length was raised from 16K to 32K live
+
+The 30B profile started at a conservative `MAX_MODEL_LEN=16384`. A real
+OpenCode "build" agent session hit it live on `scar.lab`: normal multi-turn
+coding work (file contents, tool output, accumulated conversation) fills
+16K faster than it looks like it should, and once input + the reserved
+output budget crossed 16384 tokens, the session failed outright on every
+retry —
+
+```
+AI_APICallError: This model's maximum context length is 16384 tokens.
+However, you requested 4096 output tokens and your prompt contains at
+least 12289 input tokens, for a total of at least 16385 tokens.
+```
+
+This is the baseline → change → measure → keep process in action, just
+triggered by real usage instead of a deliberate experiment. Fix: raised
+`MAX_MODEL_LEN` to 32768, restarted, re-measured. Verified live: KV cache
+dropped to 4.51 GiB / 49,248 tokens (~1.5x concurrency at the new, larger
+context — down from ~3.1x at 16K, as expected, since KV cache scales with
+context length), but real total VRAM used barely moved (~23.9 GiB either
+way) — the `GPU_MEMORY_UTILIZATION=0.68` choice held up unchanged. Also had
+to re-run `scripts/configure-opencode.sh` afterward: it derives
+`limit.context`/`limit.output` from the profile's `MAX_MODEL_LEN`, so an
+existing OpenCode config still points at the old ceiling until refreshed —
+this doesn't happen automatically on a vLLM restart.
+
+If 32K also proves insufficient for real sessions, the same process applies
+again — go bigger, re-measure KV cache/VRAM, don't just assume it still
+fits.
 
 Two things worth understanding about this setting, so it doesn't get
 over-trusted:
@@ -142,9 +178,11 @@ recommended default.
   implementations; which one is fastest/most correct on gfx1201 specifically
   is exactly the kind of thing that needs a real benchmark on this hardware,
   not a guess from documentation.
-- **Context length** (8K / 16K / 32K matrix mentioned in docs/MODELS.md) —
-  change `MAX_MODEL_LEN`, benchmark, watch VRAM headroom shrink as KV cache
-  grows.
+- **Context length beyond 32K** — the 30B profile is at 32K now (raised
+  live from 16K; see the case study above), still below the model's
+  advertised maximum. If real sessions outgrow 32K too, same process:
+  change `MAX_MODEL_LEN`, benchmark, watch KV cache capacity shrink as
+  context grows, re-run `scripts/configure-opencode.sh` afterward.
 - **`--enforce-eager`** — disables HIP graph capture. Sometimes used as a
   troubleshooting step (if graph capture itself is the source of a crash or
   startup failure) or a latency/throughput tradeoff experiment. Not a
