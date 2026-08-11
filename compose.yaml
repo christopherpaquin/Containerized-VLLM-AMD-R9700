@@ -1,0 +1,90 @@
+# vLLM OpenAI-compatible inference server for AMD ROCm (Radeon AI PRO R9700 / gfx1201).
+#
+# All host-specific and model-specific configuration comes from .env and
+# config/models/*.env — this file should not need editing to switch models,
+# change ports, or adjust GPU memory limits. See README.md and docs/.
+#
+# Usage: scripts/start.sh <model-profile>   (sets MODEL_PROFILE, then runs this)
+
+services:
+  vllm:
+    image: ${VLLM_IMAGE}
+    container_name: ${CONTAINER_NAME:-vllm}
+    restart: ${RESTART_POLICY:-unless-stopped}
+
+    # GPU access. Only the two device nodes ROCm needs are passed through —
+    # no privileged mode, no other host devices.
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "${VIDEO_GID:-video}"
+      - "${RENDER_GID:-render}"
+    security_opt:
+      - seccomp=unconfined # required by ROCm; see docs/ROCM.md
+
+    # Shared memory for ROCm/PyTorch inter-process communication. ipc: host
+    # (AMD's documented recommendation for vLLM on ROCm) makes an explicit
+    # shm_size unnecessary.
+    ipc: host
+
+    env_file:
+      - .env
+      - config/models/${MODEL_PROFILE}.env
+
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+
+    volumes:
+      - ${HF_CACHE_DIR}:/root/.cache/huggingface
+      # Persists vLLM's torch.compile cache (graph compilation + CUDA/HIP
+      # graph capture). Without this, every container restart repeats a
+      # multi-minute recompile — observed on scar.lab as ~60s of
+      # torch.compile plus CUDA graph capture on top of weight loading.
+      - ${VLLM_CACHE_DIR}:/root/.cache/vllm
+
+    ports:
+      - "${API_BIND_ADDRESS:-0.0.0.0}:${API_PORT:-8000}:8000"
+
+    # The image ships vllm on PATH; model/serving flags come from the
+    # profile env file so this line stays constant across models.
+    #
+    # NOTE: every $ below is doubled ($$) so Compose passes it through
+    # literally instead of interpolating it at parse time — these variables
+    # (MODEL_ID, QUANTIZATION, ...) only exist inside the container, via the
+    # profile's env_file, not in the shell/​.env that Compose itself reads.
+    #
+    # NOTE: each line ends in \ (an explicit shell line continuation) and
+    # that backslash must be the last character on the line. Without it, a
+    # bare newline inside sh -c ends the `exec vllm serve "$MODEL_ID"`
+    # statement right there — exec then replaces the process before the
+    # rest of the flags are ever parsed, so vLLM silently starts with only
+    # the model argument and every default (e.g. gpu-memory-utilization
+    # 0.9, not this repo's 0.72) instead of the flags below. Verified live
+    # on scar.lab — do not remove the backslashes for readability.
+    command: >
+      sh -c '
+        exec vllm serve "$$MODEL_ID" \
+          --served-model-name "$$SERVED_MODEL_NAME" \
+          --host 0.0.0.0 \
+          --port 8000 \
+          --max-model-len "$$MAX_MODEL_LEN" \
+          --gpu-memory-utilization "$$GPU_MEMORY_UTILIZATION" \
+          $${QUANTIZATION:+--quantization "$$QUANTIZATION"} \
+          $${KV_CACHE_DTYPE:+--kv-cache-dtype "$$KV_CACHE_DTYPE"} \
+          $${KV_CACHE_MEMORY_BYTES:+--kv-cache-memory-bytes "$$KV_CACHE_MEMORY_BYTES"} \
+          $$EXTRA_VLLM_ARGS
+      '
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # Cold start (first run, empty caches) measured on scar.lab for the
+      # 14B profile: ~3 min weight download + ~7 min weight load + ~1 min
+      # torch.compile/graph capture = ~13 min total. The 30B profile and any
+      # non-first run without a warm HF/torch.compile cache could take
+      # longer still — this generous window avoids a false "unhealthy"
+      # while that's happening. See docs/ROCM.md.
+      start_period: 1200s

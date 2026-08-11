@@ -1,0 +1,23 @@
+# Environment / secrets
+.env
+
+# Local state: which model profile is currently running (see scripts/lib/common.sh)
+.vllm-profile
+
+# Hugging Face cache (if ever placed under the repo instead of the configured host path)
+hf-cache/
+huggingface/
+
+# Benchmark output — machine-readable results are fine to keep locally,
+# but raw runs can get large; only commit curated results deliberately.
+benchmarks/results/*
+!benchmarks/results/.gitkeep
+
+# Python / tooling
+__pycache__/
+*.pyc
+.venv/
+
+# Editor / OS cruft
+.DS_Store
+*.swp
