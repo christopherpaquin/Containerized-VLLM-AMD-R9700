@@ -111,3 +111,74 @@ correct).
 placeholder, not a secret. This vLLM server has no authentication (see
 README "Security"); OpenCode's schema requires *some* string in that field
 for a provider to be usable, even when the backend doesn't check it.
+
+## Behavioral rules (`configure-opencode-rules.sh`)
+
+A local 30B model is noticeably more agentic-by-default and more verbose
+than a frontier hosted model — it tends to reach for tools and produce
+long, reasoning-heavy responses even for plain questions. `scripts/configure-opencode-rules.sh`
+installs a global behavioral policy that pushes back on that: answer
+questions directly, don't touch files/tools unless the request needs it,
+stay concise, keep implementation changes scoped.
+
+This is a **separate script from `configure-opencode.sh` on purpose**:
+
+| Script | Owns |
+|---|---|
+| `configure-opencode.sh` | Provider/model wiring (`provider` in `opencode.json(c)`) |
+| `configure-opencode-rules.sh` | Behavioral instructions (`AGENTS.md`) |
+| OpenCode's own permission system (`permission` in `opencode.json(c)`) | Actual tool authorization/enforcement |
+
+Rules are guidance for the model's judgment, not an enforcement boundary —
+a determined or confused model can still ignore them. Anything that must
+never happen without approval belongs in `permission`, not in `AGENTS.md`.
+
+### Source of truth and installation
+
+```bash
+scripts/configure-opencode-rules.sh            # install/update
+scripts/configure-opencode-rules.sh --status    # in sync? (no changes)
+scripts/configure-opencode-rules.sh --diff      # show what would change
+scripts/configure-opencode-rules.sh --dry-run   # preview an install, touch nothing
+scripts/configure-opencode-rules.sh --force     # reinstall even if already current
+scripts/configure-opencode-rules.sh --remove    # remove only the managed block
+```
+
+`config/opencode/AGENTS.md` in this repo is the canonical copy. The script
+installs it into OpenCode's global config directory as `AGENTS.md`
+(`~/.config/opencode/AGENTS.md` by default; the script asks
+`opencode debug paths` for the real config dir rather than assuming, in
+case of a non-default install). Confirmed directly against the installed
+OpenCode CLI binary (v1.18.16): `<config-dir>/AGENTS.md` is loaded
+automatically as global instructions, in addition to any `AGENTS.md` found
+walking up from the working directory to the project root — this isn't an
+`instructions:` config setting, it's built-in discovery. CLI and Desktop
+read the same config directory (see above), so one install covers both;
+restart Desktop to pick up a change if it's already running.
+
+### Managed-block behavior
+
+The script never overwrites the whole global file. It manages only the
+region between two markers:
+
+```text
+<!-- BEGIN SCAR-VLLM MANAGED RULES -->
+...
+<!-- END SCAR-VLLM MANAGED RULES -->
+```
+
+Anything else already in `~/.config/opencode/AGENTS.md` (personal rules,
+project notes) is left untouched. Re-running the script updates only that
+block — it never duplicates it — and is a no-op (no backup, no write) when
+the installed block already matches the repo. Any existing file is backed
+up (`AGENTS.md.bak.<UTC timestamp>`, next to the original) before a
+write actually changes it.
+
+`--remove` deletes only the managed block (also backing up first) —
+unrelated content in the file survives.
+
+### Updating the rules
+
+Edit `config/opencode/AGENTS.md` in this repo, then re-run the script to
+deploy the change. `--diff` shows exactly what would change before you
+commit to it.

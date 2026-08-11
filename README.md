@@ -34,6 +34,7 @@ scripts/preflight.sh    # validates the host before touching anything
 scripts/start.sh        # starts the default model — Qwen3-Coder-30B-A3B
 scripts/status.sh       # container/health/API/GPU state at a glance
 scripts/configure-opencode.sh   # point OpenCode CLI + Desktop at it
+scripts/configure-opencode-rules.sh   # install behavioral rules (AGENTS.md)
 ```
 
 `start.sh` with no argument starts `DEFAULT_MODEL_PROFILE` (`.env`) — Qwen3-Coder
@@ -86,6 +87,7 @@ the VRAM math behind each: see **[docs/MODELS.md](docs/MODELS.md)**.
 | `scripts/benchmark.sh <profile> [...]` | One repeatable throughput/latency measurement — see [docs/BENCHMARKING.md](docs/BENCHMARKING.md) |
 | `scripts/workstation-benchmark.sh` | Measures real VRAM headroom with the desktop actually in use — see [docs/BENCHMARKING.md](docs/BENCHMARKING.md) |
 | `scripts/configure-opencode.sh` | Configures OpenCode CLI/Desktop to use this server — see [docs/OPENCODE.md](docs/OPENCODE.md) |
+| `scripts/configure-opencode-rules.sh` | Installs/updates OpenCode's global behavioral rules (`~/.config/opencode/AGENTS.md`) — see [docs/OPENCODE.md](docs/OPENCODE.md) |
 
 ## API
 
