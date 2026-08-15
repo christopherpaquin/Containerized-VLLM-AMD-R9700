@@ -28,6 +28,14 @@ services:
     # shm_size unnecessary.
     ipc: host
 
+    # Hard cap on host RAM (weights staged on CPU, ROCm/PyTorch host
+    # buffers, ipc: host shm). Without this the container's memory use is
+    # unbounded on the host cgroup — observed live on scar.lab: unconstrained
+    # growth here (combined with everything else running) fed a kernel
+    # OOM-killer cascade that froze the box. See .env for the values and why.
+    mem_limit: ${MEM_LIMIT:-24g}
+    mem_reservation: ${MEM_RESERVATION:-20g}
+
     env_file:
       - .env
       - config/models/${MODEL_PROFILE}.env
