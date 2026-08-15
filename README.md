@@ -29,12 +29,12 @@ see [Quick start](#quick-start).
 ## Quick start
 
 ```bash
-cp .env.example .env    # then edit if needed (HF cache path, ports, ...)
-scripts/preflight.sh    # validates the host before touching anything
-scripts/start.sh        # starts the default model — Qwen3-Coder-30B-A3B
-scripts/status.sh       # container/health/API/GPU state at a glance
-scripts/configure-opencode.sh   # point OpenCode CLI + Desktop at it
-scripts/configure-opencode-rules.sh   # install behavioral rules (AGENTS.md)
+cp .env.example .env            # then edit if needed (HF cache path, ports, ...)
+scripts/preflight.sh            # validates the host before touching anything
+scripts/start.sh                # starts the default model — Qwen3-Coder-30B-A3B
+scripts/status.sh               # container/health/API/GPU state at a glance
+scripts/configure-opencode.sh   # point OpenCode at it + configure rules & compaction
+scripts/verify-opencode.sh      # verify OpenCode provider, compaction, and rules
 ```
 
 `start.sh` with no argument starts `DEFAULT_MODEL_PROFILE` (`.env`) — Qwen3-Coder
@@ -86,14 +86,26 @@ the VRAM math behind each: see **[docs/MODELS.md](docs/MODELS.md)**.
 | `scripts/gpu-info.sh` | GPU/ROCm detail: arch, VRAM, utilization, clocks, temp, power |
 | `scripts/benchmark.sh <profile> [...]` | One repeatable throughput/latency measurement — see [docs/BENCHMARKING.md](docs/BENCHMARKING.md) |
 | `scripts/workstation-benchmark.sh` | Measures real VRAM headroom with the desktop actually in use — see [docs/BENCHMARKING.md](docs/BENCHMARKING.md) |
-| `scripts/configure-opencode.sh` | Configures OpenCode CLI/Desktop to use this server — see [docs/OPENCODE.md](docs/OPENCODE.md) |
-| `scripts/configure-opencode-rules.sh` | Installs/updates OpenCode's global behavioral rules (`~/.config/opencode/AGENTS.md`) — see [docs/OPENCODE.md](docs/OPENCODE.md) |
+| `scripts/configure-opencode.sh` | Configures OpenCode provider, compaction settings, rules, and recovery plugin — see [docs/OPENCODE.md](docs/OPENCODE.md) |
+| `scripts/configure-opencode-rules.sh` | Installs/updates OpenCode's global behavioral rules (`AGENTS.md`) and compaction recovery plugin |
+| `scripts/verify-opencode.sh` | Validates OpenCode provider, model limits, compaction settings, rules, and recovery plugin |
 
 ## API
 
 OpenAI-compatible, served on **port 8000**, bound to `0.0.0.0` by default —
 reachable from the LAN, not just `localhost` (see [Security](#security)
 below). Configure via `API_PORT` / `API_BIND_ADDRESS` in `.env`.
+
+## Agent execution & context compaction
+
+OpenCode integration includes persistent behavioral rules and compaction recovery
+customizations designed specifically to keep Qwen execution-focused during long sessions:
+
+- **Execution discipline**: Read instructions → inspect git diff → implement immediately → test → update persistent state. Eliminates repetitive planning cycles and narration loops.
+- **Context compaction & tool pruning**: Configures `compaction.prune: true` in OpenCode to prune stale tool outputs and installs a custom recovery plugin (`compaction-recovery.js`) so compacted contexts preserve concrete operational state (files modified, active task, test status, blockers, next action).
+- **Persistent project state conventions**: Teaches the agent to utilize `AGENTS.md` (rules), `GOALS.md` (target state), and `IMPLEMENTATION_STATUS.md` (execution checkpoints) across compactions and session resumes.
+
+Full technical details and workflows: see **[docs/OPENCODE.md](docs/OPENCODE.md)**.
 
 ## Workstation VRAM design philosophy
 
@@ -148,17 +160,11 @@ that until you run `scripts/start.sh` again, by design (that's what
 
 ## Documentation
 
-- **[docs/ROCM.md](docs/ROCM.md)** — container image choice, device
-  passthrough details, known gfx1201-specific risks
-- **[docs/MODELS.md](docs/MODELS.md)** — model profiles, VRAM math,
-  quantization format decisions
-- **[docs/TUNING.md](docs/TUNING.md)** — VRAM budget rationale, the
-  baseline → change one thing → benchmark → compare process, candidate
-  tuning knobs (none enabled by default)
-- **[docs/BENCHMARKING.md](docs/BENCHMARKING.md)** — what `benchmark.sh`
-  and `workstation-benchmark.sh` measure and how, current limitations
-- **[docs/OPENCODE.md](docs/OPENCODE.md)** — configuring OpenCode CLI/Desktop
-  against this server, why tool-calling needed enabling server-side
+- **[docs/OPENCODE.md](docs/OPENCODE.md)** — configuring OpenCode CLI/Desktop, compaction tuning, behavioral rules, recovery plugin
+- **[docs/ROCM.md](docs/ROCM.md)** — container image choice, device passthrough details, known gfx1201-specific risks
+- **[docs/MODELS.md](docs/MODELS.md)** — model profiles, VRAM math, quantization format decisions
+- **[docs/TUNING.md](docs/TUNING.md)** — VRAM budget rationale, the baseline → change one thing → benchmark → compare process, candidate tuning knobs
+- **[docs/BENCHMARKING.md](docs/BENCHMARKING.md)** — what `benchmark.sh` and `workstation-benchmark.sh` measure and how, current limitations
 
 ## Status
 

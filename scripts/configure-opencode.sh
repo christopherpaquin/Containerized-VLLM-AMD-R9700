@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Configures OpenCode (CLI and Desktop — they share one config file; see
-# docs/OPENCODE.md) to use this repo's vLLM server as a provider.
+# docs/OPENCODE.md) to use this repo's vLLM server as a provider, configures
+# context compaction/pruning settings, and installs behavioral rules & recovery plugin.
 #
-# Surgical merge: only writes/removes provider["scar-vllm"] in the existing
-# opencode.json(c). Everything else in the file (other providers, MCP,
-# agents, plugins, preferences) is left exactly as-is. Always backs up the
+# Surgical merge: writes/updates provider["scar-vllm"] and compaction settings
+# in the existing opencode.json(c). Everything else in the file (other providers,
+# MCP, agents, plugins, preferences) is left exactly as-is. Always backs up the
 # file first. Refuses to touch a config file that isn't valid strict JSON
-# (e.g. one hand-edited with // comments) rather than risk destroying it —
-# jq round-trips have no concept of comments.
+# (e.g. one hand-edited with // comments) rather than risk destroying it.
 #
 # Usage:
 #   scripts/configure-opencode.sh [--endpoint local|lan|<url>] [--profile NAME] [--dry-run]
+#   scripts/configure-opencode.sh --skip-rules
 #   scripts/configure-opencode.sh --remove
 set -euo pipefail
 
@@ -26,10 +27,12 @@ ENDPOINT_MODE="local"
 PROFILE=""
 DRY_RUN=0
 REMOVE=0
+SKIP_RULES=0
+FORCE=0
 
 usage() {
   cat >&2 <<EOF
-Usage: $(basename "$0") [--endpoint local|lan|<url>] [--profile NAME] [--dry-run]
+Usage: $(basename "$0") [--endpoint local|lan|<url>] [--profile NAME] [--dry-run] [--skip-rules] [--force]
        $(basename "$0") --remove
 
   --endpoint local|lan|<url>  Where OpenCode should reach the vLLM API.
@@ -38,6 +41,8 @@ Usage: $(basename "$0") [--endpoint local|lan|<url>] [--profile NAME] [--dry-run
                               <url>:           used verbatim (must end in /v1)
   --profile NAME              Model profile to expose (default: DEFAULT_MODEL_PROFILE
                               from .env). Determines the served model name/id.
+  --skip-rules                Do not install/update AGENTS.md rules and compaction plugin.
+  --force                     Force rewrite even if configuration is already current.
   --dry-run                   Print what would be written; touch nothing.
   --remove                    Delete the "${PROVIDER_ID}" provider entry (rollback).
 EOF
@@ -48,6 +53,8 @@ while [[ $# -gt 0 ]]; do
     --endpoint) ENDPOINT_MODE="$2"; shift 2 ;;
     --profile) PROFILE="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --skip-rules) SKIP_RULES=1; shift ;;
+    --force) FORCE=1; shift ;;
     --remove) REMOVE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) log_fail "Unknown option: $1"; usage; exit 1 ;;
@@ -60,10 +67,12 @@ load_env
 
 # --- locate the OpenCode config file ------------------------------------
 
-# Prefer the installed CLI's own reported config directory (respects
-# OPENCODE_CONFIG and any non-default install); fall back to the documented
-# default. OpenCode Desktop reads the same file — see docs/OPENCODE.md.
-if command -v opencode >/dev/null 2>&1; then
+# Prefer an explicit OPENCODE_CONFIG_DIR override, then the installed CLI's
+# own reported config directory; fall back to the documented default.
+# OpenCode Desktop reads the same file — see docs/OPENCODE.md.
+if [[ -n "${OPENCODE_CONFIG_DIR:-}" ]]; then
+  CONFIG_DIR="$OPENCODE_CONFIG_DIR"
+elif command -v opencode >/dev/null 2>&1; then
   CONFIG_DIR="$(opencode debug paths 2>/dev/null | awk '$1=="config"{print $2}')"
 fi
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/opencode}"
@@ -81,18 +90,23 @@ fi
 if [[ "$REMOVE" -eq 1 ]]; then
   if [[ ! -f "$CONFIG_PATH" ]]; then
     log_warn "No OpenCode config found at ${CONFIG_PATH} — nothing to remove."
-    exit 0
+  else
+    if ! jq -e --arg pid "$PROVIDER_ID" '.provider[$pid] // empty' "$CONFIG_PATH" >/dev/null 2>&1; then
+      log_warn "Provider '${PROVIDER_ID}' is not present in ${CONFIG_PATH} — nothing to remove."
+    else
+      backup="${CONFIG_PATH}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+      cp "$CONFIG_PATH" "$backup"
+      tmp="$(mktemp)"
+      jq --arg pid "$PROVIDER_ID" 'del(.provider[$pid])' "$CONFIG_PATH" > "$tmp"
+      mv "$tmp" "$CONFIG_PATH"
+      log_pass "Removed provider '${PROVIDER_ID}' from ${CONFIG_PATH} (backup: ${backup})"
+    fi
   fi
-  if ! jq -e --arg pid "$PROVIDER_ID" '.provider[$pid] // empty' "$CONFIG_PATH" >/dev/null 2>&1; then
-    log_warn "Provider '${PROVIDER_ID}' is not present in ${CONFIG_PATH} — nothing to remove."
-    exit 0
+
+  if [[ "$SKIP_RULES" -eq 0 ]]; then
+    log_step "Removing managed rules and compaction plugin:"
+    "${SCRIPT_DIR}/configure-opencode-rules.sh" --remove
   fi
-  backup="${CONFIG_PATH}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
-  cp "$CONFIG_PATH" "$backup"
-  tmp="$(mktemp)"
-  jq --arg pid "$PROVIDER_ID" 'del(.provider[$pid])' "$CONFIG_PATH" > "$tmp"
-  mv "$tmp" "$CONFIG_PATH"
-  log_pass "Removed provider '${PROVIDER_ID}' from ${CONFIG_PATH} (backup: ${backup})"
   exit 0
 fi
 
@@ -116,7 +130,7 @@ case "$ENDPOINT_MODE" in
   *) log_fail "Unknown --endpoint value: '${ENDPOINT_MODE}' (expected local, lan, or a http(s):// URL)"; exit 1 ;;
 esac
 
-# --- build the provider block ---------------------------------------------
+# --- build the provider and compaction blocks -----------------------------
 
 # OpenCode has no way to know our server's --max-model-len and otherwise
 # defaults to requesting a large max_tokens (seen live: 32000), which vLLM
@@ -153,8 +167,22 @@ log_info "Endpoint: ${BASE_URL}"
 log_info "Config file: ${CONFIG_PATH}"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  log_step "Dry run — would write this provider block (nothing touched):"
-  jq -n --arg pid "$PROVIDER_ID" --argjson prov "$NEW_PROVIDER" '{provider: {($pid): $prov}}'
+  log_step "Dry run — would write provider block and compaction configuration (nothing touched):"
+  jq -n \
+    --arg pid "$PROVIDER_ID" \
+    --argjson prov "$NEW_PROVIDER" \
+    '{
+      provider: {($pid): $prov},
+      compaction: {
+        auto: true,
+        prune: true,
+        reserved: 2000
+      }
+    }'
+  if [[ "$SKIP_RULES" -eq 0 ]]; then
+    log_step "Dry run — behavioral rules and compaction plugin:"
+    "${SCRIPT_DIR}/configure-opencode-rules.sh" --dry-run
+  fi
   exit 0
 fi
 
@@ -175,16 +203,39 @@ else
   log_info "No existing OpenCode config found — created a fresh one at ${CONFIG_PATH}"
 fi
 
-backup="${CONFIG_PATH}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
-cp "$CONFIG_PATH" "$backup"
-
+# Check if changes are actually needed before creating backup
 tmp="$(mktemp)"
-jq --arg pid "$PROVIDER_ID" --argjson prov "$NEW_PROVIDER" \
-  '.provider = ((.provider // {}) + {($pid): $prov})' \
-  "$CONFIG_PATH" > "$tmp"
-mv "$tmp" "$CONFIG_PATH"
+jq --arg pid "$PROVIDER_ID" --argjson prov "$NEW_PROVIDER" '
+  .provider = ((.provider // {}) + {($pid): $prov}) |
+  .compaction = ((.compaction // {}) + {
+    auto: true,
+    prune: true,
+    reserved: (.compaction.reserved // 2000)
+  })
+' "$CONFIG_PATH" > "$tmp"
 
-log_pass "Wrote provider '${PROVIDER_ID}' to ${CONFIG_PATH} (backup: ${backup})"
+if cmp -s "$CONFIG_PATH" "$tmp" && [[ "$FORCE" -eq 0 ]]; then
+  rm -f "$tmp"
+  log_pass "OpenCode config already up to date: ${CONFIG_PATH}"
+else
+  backup="${CONFIG_PATH}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  cp "$CONFIG_PATH" "$backup"
+  mv "$tmp" "$CONFIG_PATH"
+  log_pass "Wrote provider '${PROVIDER_ID}' and compaction configuration to ${CONFIG_PATH} (backup: ${backup})"
+fi
+
+# --- install rules and compaction plugin ----------------------------------
+
+if [[ "$SKIP_RULES" -eq 0 ]]; then
+  log_step "Installing behavioral rules and compaction recovery plugin:"
+  if [[ "$FORCE" -eq 1 ]]; then
+    "${SCRIPT_DIR}/configure-opencode-rules.sh" --force
+  else
+    "${SCRIPT_DIR}/configure-opencode-rules.sh"
+  fi
+fi
+
+# --- validation -----------------------------------------------------------
 
 if command -v opencode >/dev/null 2>&1; then
   log_step "Validating with 'opencode models'"
@@ -198,4 +249,5 @@ else
 fi
 
 log_info "Test: opencode run --model ${PROVIDER_ID}/${SERVED_MODEL_NAME} \"say hi in one word\""
+log_info "Verify: ${SCRIPT_DIR}/verify-opencode.sh"
 log_info "Rollback: scripts/configure-opencode.sh --remove"

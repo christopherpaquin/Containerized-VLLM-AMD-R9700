@@ -2,164 +2,213 @@
 
 This repo's vLLM server works as a drop-in OpenAI-compatible provider for
 [OpenCode](https://opencode.ai) (CLI and Desktop), for local, no-cloud
-agentic coding. `scripts/configure-opencode.sh` wires it up.
+agentic coding. `scripts/configure-opencode.sh` wires up provider models,
+context compaction settings, behavioral execution rules, and recovery plugins.
 
 ## What it does
 
 ```bash
-scripts/configure-opencode.sh                    # local endpoint, default profile
+scripts/configure-opencode.sh                    # local endpoint, default profile + rules + compaction
 scripts/configure-opencode.sh --endpoint lan      # reachable from another machine on the LAN
 scripts/configure-opencode.sh --profile qwen25-coder-14b
 scripts/configure-opencode.sh --dry-run           # preview, touch nothing
-scripts/configure-opencode.sh --remove            # rollback
+scripts/configure-opencode.sh --skip-rules        # configure provider/compaction only
+scripts/configure-opencode.sh --remove            # rollback provider, managed rules, and plugin
+scripts/verify-opencode.sh                       # verify complete configuration and diagnostics
 ```
 
-It writes a `provider["scar-vllm"]` block into OpenCode's config file —
-surgically: only that one key is touched, so any other providers, MCP
-servers, agents, plugins, or preferences already in the file are left
-exactly as they are. It always backs up the file first
-(`opencode.json(c).bak.<timestamp>`, next to the original) and refuses to
-touch a config file that isn't valid strict JSON (e.g. hand-edited with `//`
-comments) rather than risk silently deleting them — merges are done with
-`jq`, which has no concept of comments.
+It performs a surgical merge into OpenCode's config file (`opencode.json` / `opencode.jsonc`):
+- Writes `provider["scar-vllm"]` with served model limits and tool calling.
+- Configures `compaction` (`auto: true`, `prune: true`, `reserved: 2000`).
+- Installs global behavioral rules (`AGENTS.md`) into `<config_dir>/AGENTS.md`.
+- Installs the custom compaction recovery plugin into `<config_dir>/plugins/compaction-recovery.js`.
+
+Any other providers, MCP servers, agents, plugins, or preferences already in the
+file are left untouched. It always creates timestamped backups before modifying
+existing files (`.bak.<timestamp>`) and refuses to touch config files that are not
+valid strict JSON (e.g. hand-edited with `//` comments).
 
 The resulting model identifier is `scar-vllm/<served-model-name>` — e.g.
-`scar-vllm/qwen3-coder-30b-a3b` for the default profile. The served model
-name comes directly from the model profile's `SERVED_MODEL_NAME`, not a
-hardcoded string, so it always matches whatever vLLM is actually serving.
+`scar-vllm/qwen3-coder-30b-a3b` for the default profile.
+
+---
 
 ## CLI and Desktop share one config
 
-Verified live on `scar.lab`, not assumed: OpenCode Desktop is an Electron
-app that embeds the *same* core `opencode` engine as the CLI. Its own
-Electron `userData` dir (`~/.config/ai.opencode.desktop`) is separate and
-only holds browser-window state (cache, cookies, crash reports) — but the
-embedded engine's own data/log files
-(`~/.local/share/opencode/opencode.db`, `~/.local/share/opencode/log/opencode.log`)
-are the *same files* the CLI uses, confirmed by inspecting the running
-Desktop process's open file descriptors. Desktop's own log recorded
-`providerID=scar-vllm modelID=qwen3-coder-30b-a3b` immediately after
-launch, with no separate configuration step — it just picked up the config
-file `scripts/configure-opencode.sh` had already written for the CLI.
+Verified live on `scar.lab`: OpenCode Desktop is an Electron app that embeds
+the *same* core `opencode` engine as the CLI. Its own Electron `userData` dir
+(`~/.config/ai.opencode.desktop`) only holds browser-window state — the
+embedded engine's config and data files (`~/.config/opencode/`,
+`~/.local/share/opencode/`) are the *same files* the CLI uses.
 
 Practical implications:
-- One `scripts/configure-opencode.sh` run configures both.
-- If Desktop is already running when you (re-)run the script, restart it to
-  pick up the change (it doesn't watch the file live, as far as tested).
-- `--remove` removes access from both.
+- Running `scripts/configure-opencode.sh` configures both CLI and Desktop.
+- If Desktop is already running when configuring, restart it to pick up changes.
+- `--remove` rolls back configuration for both.
 
-## Why tool calling needed to be enabled server-side
+---
 
-OpenCode is an agentic tool — it reads/writes files and runs commands via
-tool calls, not just chat. The first live test against this repo's vLLM
-server failed immediately:
+## Why tool calling is enabled server-side
 
-```
-Error: "auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set
-```
-
-Both model profiles now set this via `EXTRA_VLLM_ARGS`:
+OpenCode is an agentic coding assistant — it reads/writes files and runs commands
+via tool calls, not just chat completions. Both model profiles configure tool
+calling via `EXTRA_VLLM_ARGS`:
 
 | Profile | Parser | Why this one |
 |---|---|---|
-| `qwen3-coder-30b-a3b` | `qwen3_xml` | vLLM also ships a `qwen3_coder` parser, but it has a reported bug producing runaway `"!!!!"` output on long inputs containing a tool call. `qwen3_xml` is documented as the more stable choice for Qwen3-Coder specifically. |
+| `qwen3-coder-30b-a3b` | `qwen3_xml` | `qwen3_xml` is documented as the most stable choice for Qwen3-Coder (avoiding runaway `"!!!!"` loops reported on `qwen3_coder`). |
 | `qwen25-coder-14b` | `hermes` | vLLM's standard tool-call parser for the Qwen2.5-Instruct family. |
 
-**Known rough edge (observed live, not blocking):** the `qwen3_xml` parser
-occasionally logs `Error when parsing XML elements: not well-formed
-(invalid token)` on some tool-call outputs. It didn't prevent success in
-testing here (the request still completed correctly), but if you see
-garbled or failed tool calls from OpenCode, check the vLLM container logs
-for this — it's a parser-side issue with this specific vLLM
-version/checkpoint combination, not something `configure-opencode.sh`
-controls.
+---
 
-## Why the provider config sets `limit.context` / `limit.output`
+## Context limits (`limit.context` / `limit.output`)
 
-OpenCode has no way to know this server's `--max-model-len` on its own, and
-defaults to requesting a large `max_tokens` (observed live: 32000) — which
-vLLM rejects outright once it exceeds `max_model_len`:
+OpenCode cannot automatically infer the server's `--max-model-len` and defaults
+to requesting large `max_tokens` (e.g. 32000), which vLLM rejects if it exceeds
+the model's max context length.
 
+`configure-opencode.sh` sets `limit.context` to the profile's `MAX_MODEL_LEN`
+(32768 for Qwen3-Coder) and `limit.output` to a quarter of that (8192 tokens),
+leaving the remaining context for conversation history, file contents, and tool results.
+
+---
+
+## Agent execution behavior & anti-looping rules
+
+Local models (like Qwen3-Coder-30B) are capable of high-throughput agentic work
+(~43 tok/s), but can easily get trapped in degenerative behaviors during long sessions:
+
+- **Repeated planning**: Re-analyzing the whole codebase and producing repetitive multi-step roadmaps.
+- **File re-reading loops**: Continually re-reading the same files before acting.
+- **Excessive narration**: Narrating intended actions ("I need to examine X...") instead of using tools.
+- **Compaction amnesia**: Losing implementation state after context compaction and restarting discovery.
+- **Hesitation to edit**: Talking about code changes rather than applying them.
+
+`config/opencode/AGENTS.md` establishes strict behavioral defaults to eliminate these loops:
+
+### Execution discipline workflow
+
+```text
+Receive task
+    ↓
+Read repository instructions (AGENTS.md / rules)
+    ↓
+Read persistent implementation state if present (IMPLEMENTATION_STATUS.md)
+    ↓
+Inspect git status / git diff
+    ↓
+Inspect only relevant source files needed for current step
+    ↓
+Implement immediately
+    ↓
+Test / validate
+    ↓
+Update implementation state (IMPLEMENTATION_STATUS.md)
+    ↓
+Continue to next actionable item
 ```
-AI_APICallError: max_tokens=32000 cannot be greater than max_model_len=max_total_tokens=16384
+
+### Action over narration
+
+- **Bad:** "I need to examine endpoints.py to understand the current implementation."
+- **Preferred:** `[read endpoints.py]`
+- **Bad:** "The next step is to implement the API changes."
+- **Preferred:** `[edit necessary files]` followed by `[run tests]`
+
+---
+
+## Persistent project state conventions
+
+To make long-running tasks resilient across context compactions and separate sessions,
+the global rules teach the agent to recognize standard persistent state files:
+
+| File | Purpose | Intended usage |
+|---|---|---|
+| `AGENTS.md` | Repository-specific instructions, conventions, and constraints. | Read at task start and after compaction. Source of truth for repo rules. |
+| `GOALS.md` | Target project end state, scope, architecture, and feature requirements. | Read to understand desired outcome. (Never assumed to be implemented without verifying code). |
+| `IMPLEMENTATION_STATUS.md` | Persistent execution checkpoint: current objective, completed items, active task, test status, blockers. | Primary persistent memory across compactions and turns. Updated upon milestone completion. |
+
+Repositories are not required to contain all three files; agents dynamically inspect
+and utilize whatever combination is present.
+
+---
+
+## Context compaction & recovery
+
+### What context compaction is
+When an OpenCode session accumulates tokens approaching the model's context window
+(32,768 tokens for Qwen3-Coder), OpenCode triggers **compaction**: older turns are
+condensed into a summary so the session can continue without failing with a context overflow error.
+
+### Why 32K models hit compaction frequently
+In active coding sessions, reading large files, examining ASTs/greps, and inspecting build/test
+outputs rapidly consumes 15K–25K tokens. In a 32K context window, compaction is a normal,
+frequent lifecycle event.
+
+### Why tool output pruning (`compaction.prune`) is critical
+Historical tool outputs (e.g. a 500-line file read from 10 turns ago) remain in context
+unless pruned. Enabling `"compaction": { "prune": true }` automatically strips obsolete
+completed tool outputs older than recent turns, preserving critical conversational context
+and drastically reducing unnecessary compaction cycles.
+
+### Custom compaction recovery plugin (`compaction-recovery.js`)
+By default, generic compaction summaries preserve conversational history and lose exact
+technical details. `config/opencode/plugins/compaction-recovery.js` hooks into OpenCode's
+`experimental.session.compacting` event to enforce a structured operational summary:
+
+```text
+## CURRENT OBJECTIVE
+## CURRENT TASK
+## COMPLETED WORK
+## FILES MODIFIED
+## FILES CURRENTLY BEING WORKED ON
+## TESTS RUN & RESULTS
+## KNOWN FAILURES & BLOCKERS
+## IMPORTANT USER CONSTRAINTS
+## NEXT ACTION
+## DO NOT REPEAT
 ```
 
-`configure-opencode.sh` sets the model's `limit.context` to the profile's
-`MAX_MODEL_LEN` and `limit.output` to a quarter of that (a reasonable
-completion-length cap for coding-agent-style usage, leaving the rest of the
-context for the prompt and tool-call history). Without this, every OpenCode
-request against this provider fails before reaching the model at all.
+### Post-compaction recovery sequence
+Following compaction, the agent does **NOT** attempt to re-discover the project or re-plan.
+Instead, it executes this deterministic recovery procedure:
 
-## Verifying it works
+```text
+Compaction
+    ↓
+1. Read repository instructions (AGENTS.md)
+    ↓
+2. Read IMPLEMENTATION_STATUS.md (if present)
+    ↓
+3. Run git status --short and inspect git diff
+    ↓
+4. Identify files modified but not yet validated
+    ↓
+5. Determine exact unfinished task
+    ↓
+6. Resume implementation immediately
+```
+
+If `IMPLEMENTATION_STATUS.md` conflicts with actual source code or test results,
+the code and test results are authoritative.
+
+---
+
+## Behavioral rules management (`configure-opencode-rules.sh`)
+
+`scripts/configure-opencode-rules.sh` can also be run independently:
 
 ```bash
-opencode models | grep scar-vllm
-opencode run --model scar-vllm/qwen3-coder-30b-a3b "say hi in one word"
+scripts/configure-opencode-rules.sh            # install/update rules and plugin
+scripts/configure-opencode-rules.sh --status    # check if installed files match repo
+scripts/configure-opencode-rules.sh --diff      # show differences
+scripts/configure-opencode-rules.sh --dry-run   # preview changes
+scripts/configure-opencode-rules.sh --force     # force rewrite
+scripts/configure-opencode-rules.sh --remove    # remove managed rules and plugin
 ```
 
-Editing the config file is not sufficient validation — confirm the request
-actually reaches vLLM: `docker compose logs vllm` (or `docker logs vllm`)
-should show a `POST /v1/chat/completions` line matching the request. This
-was verified live end-to-end on `scar.lab`, including a real tool call
-(asking OpenCode to read a file and report its contents, and separately to
-write a small Python script — both succeeded, tools fired, output was
-correct).
-
-## Security note
-
-`options.apiKey` is set to the literal string `local-no-auth-required` — a
-placeholder, not a secret. This vLLM server has no authentication (see
-README "Security"); OpenCode's schema requires *some* string in that field
-for a provider to be usable, even when the backend doesn't check it.
-
-## Behavioral rules (`configure-opencode-rules.sh`)
-
-A local 30B model is noticeably more agentic-by-default and more verbose
-than a frontier hosted model — it tends to reach for tools and produce
-long, reasoning-heavy responses even for plain questions. `scripts/configure-opencode-rules.sh`
-installs a global behavioral policy that pushes back on that: answer
-questions directly, don't touch files/tools unless the request needs it,
-stay concise, keep implementation changes scoped.
-
-This is a **separate script from `configure-opencode.sh` on purpose**:
-
-| Script | Owns |
-|---|---|
-| `configure-opencode.sh` | Provider/model wiring (`provider` in `opencode.json(c)`) |
-| `configure-opencode-rules.sh` | Behavioral instructions (`AGENTS.md`) |
-| OpenCode's own permission system (`permission` in `opencode.json(c)`) | Actual tool authorization/enforcement |
-
-Rules are guidance for the model's judgment, not an enforcement boundary —
-a determined or confused model can still ignore them. Anything that must
-never happen without approval belongs in `permission`, not in `AGENTS.md`.
-
-### Source of truth and installation
-
-```bash
-scripts/configure-opencode-rules.sh            # install/update
-scripts/configure-opencode-rules.sh --status    # in sync? (no changes)
-scripts/configure-opencode-rules.sh --diff      # show what would change
-scripts/configure-opencode-rules.sh --dry-run   # preview an install, touch nothing
-scripts/configure-opencode-rules.sh --force     # reinstall even if already current
-scripts/configure-opencode-rules.sh --remove    # remove only the managed block
-```
-
-`config/opencode/AGENTS.md` in this repo is the canonical copy. The script
-installs it into OpenCode's global config directory as `AGENTS.md`
-(`~/.config/opencode/AGENTS.md` by default; the script asks
-`opencode debug paths` for the real config dir rather than assuming, in
-case of a non-default install). Confirmed directly against the installed
-OpenCode CLI binary (v1.18.16): `<config-dir>/AGENTS.md` is loaded
-automatically as global instructions, in addition to any `AGENTS.md` found
-walking up from the working directory to the project root — this isn't an
-`instructions:` config setting, it's built-in discovery. CLI and Desktop
-read the same config directory (see above), so one install covers both;
-restart Desktop to pick up a change if it's already running.
-
-### Managed-block behavior
-
-The script never overwrites the whole global file. It manages only the
-region between two markers:
+### Managed-block safety
+`AGENTS.md` is installed inside managed block delimiters:
 
 ```text
 <!-- BEGIN SCAR-VLLM MANAGED RULES -->
@@ -167,18 +216,33 @@ region between two markers:
 <!-- END SCAR-VLLM MANAGED RULES -->
 ```
 
-Anything else already in `~/.config/opencode/AGENTS.md` (personal rules,
-project notes) is left untouched. Re-running the script updates only that
-block — it never duplicates it — and is a no-op (no backup, no write) when
-the installed block already matches the repo. Any existing file is backed
-up (`AGENTS.md.bak.<UTC timestamp>`, next to the original) before a
-write actually changes it.
+Any existing user rules outside these delimiters are preserved untouched.
 
-`--remove` deletes only the managed block (also backing up first) —
-unrelated content in the file survives.
+---
 
-### Updating the rules
+## Verification script (`verify-opencode.sh`)
 
-Edit `config/opencode/AGENTS.md` in this repo, then re-run the script to
-deploy the change. `--diff` shows exactly what would change before you
-commit to it.
+Run `scripts/verify-opencode.sh` to run a non-destructive audit of the complete configuration:
+
+```bash
+scripts/verify-opencode.sh
+```
+
+Checks verified:
+- [x] OpenCode CLI binary installed and version detected.
+- [x] `opencode.json(c)` exists and is strictly valid JSON.
+- [x] `scar-vllm` provider configured with valid `/v1` endpoint.
+- [x] Served Qwen model configured with `tool_call: true`, valid `limit.context`, and `limit.output`.
+- [x] Compaction settings enabled (`compaction.auto: true`, `compaction.prune: true`, `compaction.reserved`).
+- [x] Global `AGENTS.md` contains the valid managed block and execution discipline rules.
+- [x] Custom compaction recovery plugin is installed in `<config_dir>/plugins/`.
+- [x] No duplicate or corrupted marker blocks exist.
+
+---
+
+## Verifying end-to-end inference
+
+```bash
+opencode models | grep scar-vllm
+opencode run --model scar-vllm/qwen3-coder-30b-a3b "say hi in one word"
+```
